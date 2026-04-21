@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased (fork: bo0tzz/birdnetgo-esp32-solar)
+- Battery monitor: read a 1S LiPo via a 2:1 voltage divider on GPIO0 (A0) using the factory-calibrated ADC (`analogReadMilliVolts` at 11 dB attenuation, 16-sample average, 10 s poll).
+- New `/api/status` fields: `battery_present` (bool), `battery_mv` (int), `battery_percent` (int 0..100, `-1` when absent).
+- Same fields added to the MQTT `<topic>/state` payload.
+- Home Assistant MQTT Discovery: two new entities — `Battery Voltage` (V, `dev_cla:voltage`) and `Battery` (%, `dev_cla:battery`). Both return `unknown` when the battery is absent, keyed on `battery_present`.
+- Web UI Status card: new Battery row (`3.87 V (60%)` or `—`).
+- Compile-time constants in the sketch: `BAT_ADC_PIN`, `BAT_DIVIDER_RATIO`, `BAT_PRESENT_MV_THRESHOLD`. No runtime calibration UI (yet) — edit the sketch for different hardware.
+
 ## 1.6.0 — 2026-02-13
 - MQTT: publish interval is now configurable in UI/API (`mqtt_interval`), persisted in NVS (`mqttIntSec`), default `60 s` (range `10..3600`).
 - MQTT state payload extended with diagnostics: `fw_build`, `reboot_reason`, `restart_counter`, `wifi_ssid`, `wifi_reconnect_count`, `stream_uptime_s`, `client_count`, `audio_format`.

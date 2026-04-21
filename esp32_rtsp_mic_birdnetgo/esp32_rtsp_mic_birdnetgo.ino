@@ -151,6 +151,19 @@ String overheatLastTimestamp = "";
 bool overheatSensorFault = false;
 bool overheatLatched = false;
 
+// -- Battery monitor (external 1S LiPo + voltage divider to ADC)
+// Wiring: BAT+ --[220k]-- GPIO0 (A0 on XIAO ESP32-C6) --[220k]-- GND
+// Equal resistors → Vadc = Vbat / 2. ADC1_CH0 is WiFi-safe (ADC2 is not).
+#define BAT_ADC_PIN 0                    // GPIO0 / A0 / ADC1_CH0 on ESP32-C6
+#define BAT_DIVIDER_RATIO 2.0f           // Vbat / Vadc (220k/220k)
+#define BAT_PRESENT_MV_THRESHOLD 2800    // below this → no battery (USB-only)
+#define BAT_READ_INTERVAL_MS 10000UL     // poll every 10 s in loop()
+#define BAT_SAMPLES 16                   // ADC samples averaged per reading
+int32_t batteryMv = 0;                   // last computed battery voltage (mV)
+int8_t  batteryPercent = -1;             // 0..100, -1 when absent/unknown
+bool    batteryPresent = false;          // true when voltage >= threshold
+unsigned long lastBatteryCheck = 0;
+
 // -- Scheduled reset
 bool scheduledResetEnabled = false;
 uint32_t resetIntervalHours = 24; // Default 24 hours
@@ -501,6 +514,9 @@ static String mqttBuildStateJson() {
     json += "\"max_temperature_c\":" + String(maxTemperature, 1) + ",";
     json += "\"overheat_latched\":" + String(overheatLatched ? "true" : "false") + ",";
     json += "\"mdns_enabled\":" + String(mdnsEnabled ? "true" : "false") + ",";
+    json += "\"battery_present\":" + String(batteryPresent ? "true" : "false") + ",";
+    json += "\"battery_mv\":" + String(batteryMv) + ",";
+    json += "\"battery_percent\":" + String((int)batteryPercent) + ",";
     json += "\"time_synced\":" + String(timeSynced ? "true" : "false");
     json += "}";
     return json;
@@ -588,6 +604,14 @@ static bool mqttPublishDiscovery() {
 
     p = "{\"name\":\"Audio Format\",\"uniq_id\":\"" + mqttDeviceId + "_audio_format\",\"stat_t\":\"" + st + "\",\"val_tpl\":\"{{ value_json.audio_format }}\",\"ent_cat\":\"diagnostic\",\"avty_t\":\"" + av + "\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\",\"dev\":" + dev + "}";
     ok &= mqttPublishDiscoveryConfig("sensor", "audio_format", p);
+
+    // Battery voltage (V); reports 'unknown' when battery absent.
+    p = "{\"name\":\"Battery Voltage\",\"uniq_id\":\"" + mqttDeviceId + "_bat_v\",\"stat_t\":\"" + st + "\",\"val_tpl\":\"{% if value_json.battery_present %}{{ (value_json.battery_mv / 1000) | round(2) }}{% else %}unknown{% endif %}\",\"unit_of_meas\":\"V\",\"dev_cla\":\"voltage\",\"stat_cla\":\"measurement\",\"ent_cat\":\"diagnostic\",\"avty_t\":\"" + av + "\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\",\"dev\":" + dev + "}";
+    ok &= mqttPublishDiscoveryConfig("sensor", "battery_v", p);
+
+    // Battery SoC (%); reports 'unknown' when battery absent.
+    p = "{\"name\":\"Battery\",\"uniq_id\":\"" + mqttDeviceId + "_bat_pct\",\"stat_t\":\"" + st + "\",\"val_tpl\":\"{% if value_json.battery_present %}{{ value_json.battery_percent }}{% else %}unknown{% endif %}\",\"unit_of_meas\":\"%\",\"dev_cla\":\"battery\",\"stat_cla\":\"measurement\",\"avty_t\":\"" + av + "\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\",\"dev\":" + dev + "}";
+    ok &= mqttPublishDiscoveryConfig("sensor", "battery_pct", p);
 
     p = "{\"name\":\"Reboot Device\",\"uniq_id\":\"" + mqttDeviceId + "_reboot\",\"cmd_t\":\"" + cmdReboot + "\",\"pl_prs\":\"PRESS\",\"ent_cat\":\"config\",\"avty_t\":\"" + av + "\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\",\"dev\":" + dev + "}";
     ok &= mqttPublishDiscoveryConfig("button", "reboot", p);
@@ -1221,6 +1245,52 @@ static bool isTemperatureValid(float temp) {
     if (isnan(temp) || isinf(temp)) return false;
     if (temp < -20.0f || temp > 130.0f) return false;
     return true;
+}
+
+// 1S LiPo discharge curve → SoC %. Piecewise linear between measured points
+// (light-load / rested). Not a fuel gauge — values sag during heavy TX.
+static int8_t lipoPercentFromMv(int32_t mv) {
+    struct P { int16_t mv; int8_t pct; };
+    static const P curve[] = {
+        {3270,   0}, {3610,   5}, {3690,  10}, {3710,  15},
+        {3730,  20}, {3750,  25}, {3770,  30}, {3790,  35},
+        {3800,  40}, {3820,  45}, {3840,  50}, {3850,  55},
+        {3870,  60}, {3910,  65}, {3950,  70}, {3980,  75},
+        {4020,  80}, {4080,  85}, {4110,  90}, {4150,  95},
+        {4200, 100},
+    };
+    const size_t n = sizeof(curve) / sizeof(curve[0]);
+    if (mv <= curve[0].mv) return 0;
+    if (mv >= curve[n-1].mv) return 100;
+    for (size_t i = 1; i < n; ++i) {
+        if (mv <= curve[i].mv) {
+            const int32_t v0 = curve[i-1].mv, v1 = curve[i].mv;
+            const int32_t p0 = curve[i-1].pct, p1 = curve[i].pct;
+            return (int8_t)(p0 + ((mv - v0) * (p1 - p0)) / (v1 - v0));
+        }
+    }
+    return 100;
+}
+
+static void setupBattery() {
+    // 11 dB attenuation → ~0..3.3 V usable; factory calibration via analogReadMilliVolts().
+    // Max expected at 4.2 V LiPo / 2.0 divider = 2.1 V — well inside the linear region.
+    analogSetPinAttenuation(BAT_ADC_PIN, ADC_11db);
+    simplePrintln("Battery monitor: ADC GPIO" + String(BAT_ADC_PIN) +
+                  ", divider " + String(BAT_DIVIDER_RATIO, 2) + "x, present>=" +
+                  String(BAT_PRESENT_MV_THRESHOLD) + " mV");
+}
+
+static void readBattery() {
+    uint32_t sum = 0;
+    for (uint8_t i = 0; i < BAT_SAMPLES; ++i) {
+        sum += analogReadMilliVolts(BAT_ADC_PIN);
+    }
+    const int32_t adcMv = (int32_t)(sum / BAT_SAMPLES);
+    const int32_t vbatMv = (int32_t)((float)adcMv * BAT_DIVIDER_RATIO + 0.5f);
+    batteryMv = vbatMv;
+    batteryPresent = (vbatMv >= BAT_PRESENT_MV_THRESHOLD);
+    batteryPercent = batteryPresent ? lipoPercentFromMv(vbatMv) : (int8_t)-1;
 }
 
 // Format current local time, fallback to uptime when no RTC/NTP time available
@@ -2010,6 +2080,9 @@ void setup() {
     // Load settings from flash
     loadAudioSettings();
 
+    // Battery monitor: configure ADC attenuation (safe to call pre-WiFi; ADC1 is WiFi-safe).
+    setupBattery();
+
     // Allocate buffers with current size
     i2s_32bit_buffer = (int32_t*)malloc(currentBufferSize * sizeof(int32_t));
     i2s_16bit_buffer = (int16_t*)malloc(currentBufferSize * sizeof(int16_t));
@@ -2092,6 +2165,14 @@ void setup() {
     setCpuFrequencyMhz(cpuFrequencyMhz);
     simplePrintln("CPU frequency set to " + String(cpuFrequencyMhz) + " MHz for optimal thermal/performance balance");
 
+    readBattery();
+    lastBatteryCheck = millis();
+    if (batteryPresent) {
+        simplePrintln("Battery: " + String(batteryMv) + " mV (" + String((int)batteryPercent) + "%)");
+    } else {
+        simplePrintln("Battery: absent or below threshold (USB-only?) - " + String(batteryMv) + " mV");
+    }
+
     if (!overheatLatched && rtspServerEnabled) {
         simplePrintln("RTSP server ready on port 8554");
         simplePrintln("RTSP URL (IP): rtsp://" + WiFi.localIP().toString() + ":8554/audio");
@@ -2139,6 +2220,11 @@ void loop() {
     if (millis() - lastWiFiCheck > 30000) { // 30 s
         checkWiFiHealth(); // without TX power log spam
         lastWiFiCheck = millis();
+    }
+
+    if (millis() - lastBatteryCheck > BAT_READ_INTERVAL_MS) {
+        readBattery();
+        lastBatteryCheck = millis();
     }
 
     checkTimeSync();

@@ -57,6 +57,9 @@ extern bool overheatSensorFault;
 extern float lastTemperatureC;
 extern bool lastTemperatureValid;
 extern bool overheatLatched;
+extern int32_t batteryMv;
+extern int8_t batteryPercent;
+extern bool batteryPresent;
 
 // Local helper: snap requested Wi‑Fi TX power (dBm) to nearest supported step
 static float snapWifiTxDbm(float dbm) {
@@ -246,7 +249,10 @@ static void httpStatus() {
     json += "\"streaming\":" + String(isStreaming?"true":"false") + ",";
     json += "\"current_rate_pkt_s\":" + String(currentRate) + ",";
     json += "\"last_rtsp_connect\":\"" + jsonEscape(formatSince(lastRtspClientConnectMs)) + "\",";
-    json += "\"last_stream_start\":\"" + jsonEscape(formatSince(lastRtspPlayMs)) + "\"";
+    json += "\"last_stream_start\":\"" + jsonEscape(formatSince(lastRtspPlayMs)) + "\",";
+    json += "\"battery_present\":" + String(batteryPresent?"true":"false") + ",";
+    json += "\"battery_mv\":" + String(batteryMv) + ",";
+    json += "\"battery_percent\":" + String((int)batteryPercent);
     json += "}";
     apiSendJSON(json);
 }

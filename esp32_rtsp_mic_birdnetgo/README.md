@@ -275,6 +275,43 @@ Mutating API calls use `POST` and require header `X-ESP32MIC-CSRF: 1` (already s
 - After editing the UI, regenerate the embedded gzip header:
   - `./tools/gen_webui_gzip_header.sh`
 
+### Battery Monitor (Optional)
+
+If the board runs off a 1S LiPo (e.g. a solar setup), the firmware can report battery
+voltage and state-of-charge.
+
+Wiring: `BAT+ ── 220kΩ ── GPIO0/A0 ── 220kΩ ── GND`, plus **a 100 nF ceramic
+between GPIO0 and GND, close to the XIAO**. With equal resistors the ADC sees
+`Vbat / 2`. GPIO0 is `ADC1_CH0` on ESP32-C6 — WiFi-safe, unlike ADC2. The
+firmware uses factory-calibrated `analogReadMilliVolts` at 11 dB attenuation,
+averaged over 16 samples, polled every 10 s.
+
+Skipping the 100 nF will result in fluctuating/unreliable readings (±150 mV is
+typical). The 220k/220k divider has 110 kΩ Thévenin source impedance; Espressif
+recommends ≲10 kΩ for the SAR ADC's sample-and-hold to settle. The cap acts as
+a low-impedance charge reservoir for the S/H window and trickle-recharges through
+the divider. Lower-value resistors would also work but draw 22× more standby
+current — bad for solar.
+
+Compile-time constants (in `esp32_rtsp_mic_birdnetgo.ino`):
+
+- `BAT_ADC_PIN 0` — ADC pin (A0 on XIAO ESP32-C6).
+- `BAT_DIVIDER_RATIO 2.0f` — `Vbat / Vadc`. Change for unequal resistors.
+- `BAT_PRESENT_MV_THRESHOLD 2800` — below this, firmware reports "no battery" (e.g.
+  running off USB with the battery disconnected).
+
+Exposed fields:
+
+- Web UI Status card: `Battery` row — `3.87 V (60%)` or `—`.
+- `/api/status` JSON: `battery_present` (bool), `battery_mv` (int),
+  `battery_percent` (int 0..100, `-1` when absent).
+- MQTT `<topic>/state`: same three fields.
+- Home Assistant Discovery: `Battery Voltage` (V, `dev_cla:voltage`) and
+  `Battery` (%, `dev_cla:battery`). Both show `unknown` when the battery is absent.
+
+State-of-charge comes from a piecewise-linear 1S LiPo discharge curve (light load).
+It is indicative, not a fuel gauge — readings sag ~100–300 mV during heavy TX bursts.
+
 ### MQTT & Home Assistant Discovery
 
 - New Web UI card: **MQTT & Home Assistant**.
